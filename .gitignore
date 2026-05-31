@@ -10,6 +10,7 @@ venv/
 .env
 .env.*
 *.local
+.awscreds
 
 # TLS certs/keys and secrets
 *.key
