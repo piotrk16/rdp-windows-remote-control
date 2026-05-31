@@ -1,4 +1,5 @@
 import argparse
+import select
 import socket
 import threading
 from dataclasses import dataclass, field
@@ -14,16 +15,7 @@ SessionKey = Tuple[str, str]
 class Pair:
     host_sock: socket.socket
     client_sock: socket.socket
-    ready_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
-    ready_lock: threading.Lock = field(default_factory=threading.Lock)
-    ready_count: int = 0
-
-    def mark_ready(self) -> None:
-        with self.ready_lock:
-            self.ready_count += 1
-            if self.ready_count >= 2:
-                self.ready_event.set()
 
 
 @dataclass
@@ -42,28 +34,30 @@ class GatewayState:
         self.waiting_hosts: Dict[SessionKey, Endpoint] = {}
         self.waiting_clients: Dict[SessionKey, Endpoint] = {}
 
-    def register(self, endpoint: Endpoint) -> tuple[Optional[Pair], bool]:
+    def register(self, endpoint: Endpoint) -> tuple[Optional[Pair], Optional[Endpoint]]:
         with self.lock:
             if endpoint.role == "host":
                 peer = self.waiting_clients.pop(endpoint.key, None)
                 if peer is None:
                     self.waiting_hosts[endpoint.key] = endpoint
-                    return None, False
+                    return None, None
                 pair = Pair(host_sock=endpoint.sock, client_sock=peer.sock)
                 endpoint.pair = pair
                 peer.pair = pair
+                endpoint.paired_event.set()
                 peer.paired_event.set()
-                return pair, True
+                return pair, peer
 
             peer = self.waiting_hosts.pop(endpoint.key, None)
             if peer is None:
                 self.waiting_clients[endpoint.key] = endpoint
-                return None, False
+                return None, None
             pair = Pair(host_sock=peer.sock, client_sock=endpoint.sock)
             endpoint.pair = pair
             peer.pair = pair
+            endpoint.paired_event.set()
             peer.paired_event.set()
-            return pair, True
+            return pair, peer
 
     def remove_waiting(self, endpoint: Endpoint) -> None:
         with self.lock:
@@ -113,8 +107,6 @@ def pipe(src: socket.socket, dst: socket.socket, stop: threading.Event) -> None:
 
 def relay_pair(pair: Pair) -> None:
     stop = threading.Event()
-    pair.ready_event.wait()
-
     t = threading.Thread(target=pipe, args=(pair.host_sock, pair.client_sock, stop), daemon=True)
     t.start()
     pipe(pair.client_sock, pair.host_sock, stop)
@@ -132,9 +124,27 @@ def relay_pair(pair: Pair) -> None:
     pair.done_event.set()
 
 
+def wait_for_pair_or_disconnect(endpoint: Endpoint) -> Pair:
+    while not endpoint.paired_event.wait(timeout=1.0):
+        readable, _, exceptional = select.select([endpoint.sock], [], [endpoint.sock], 0)
+        if exceptional:
+            raise ConnectionError("Socket error while waiting for pair")
+        if readable:
+            try:
+                probe = endpoint.sock.recv(1, socket.MSG_PEEK)
+            except OSError as exc:
+                raise ConnectionError("Socket closed while waiting for pair") from exc
+            if not probe:
+                raise ConnectionError("Socket closed while waiting for pair")
+
+    if endpoint.pair is None:
+        raise RuntimeError("Pairing failed unexpectedly")
+    return endpoint.pair
+
+
 def handle_connection(client_sock: socket.socket, addr: Tuple[str, int], state: GatewayState) -> None:
     endpoint: Optional[Endpoint] = None
-    relay_thread_started = False
+    pair: Optional[Pair] = None
 
     try:
         client_sock.settimeout(120.0)
@@ -142,30 +152,19 @@ def handle_connection(client_sock: socket.socket, addr: Tuple[str, int], state: 
         role, key = validate_registration(packet)
         endpoint = Endpoint(sock=client_sock, addr=addr, role=role, key=key)
 
-        pair, should_start = state.register(endpoint)
+        pair, peer = state.register(endpoint)
         if pair is None:
             send_line_json(client_sock, {"type": "wait"})
-            while not endpoint.paired_event.wait(timeout=1.0):
-                try:
-                    probe = client_sock.recv(1, socket.MSG_PEEK)
-                except TimeoutError:
-                    continue
-                except OSError:
-                    raise ConnectionError("Socket closed while waiting for pair")
-                if not probe:
-                    raise ConnectionError("Socket closed while waiting for pair")
-            pair = endpoint.pair
-            if pair is None:
-                raise RuntimeError("Pairing failed unexpectedly")
-        
-        client_sock.settimeout(None)
-        send_line_json(client_sock, {"type": "paired"})
-        pair.mark_ready()
-
-        if should_start:
-            relay_thread_started = True
+            pair = wait_for_pair_or_disconnect(endpoint)
+        else:
+            client_sock.settimeout(None)
+            if peer is None:
+                raise RuntimeError("Expected peer endpoint for completed pair")
+            send_line_json(peer.sock, {"type": "paired"})
+            send_line_json(client_sock, {"type": "paired"})
             threading.Thread(target=relay_pair, args=(pair,), daemon=True).start()
 
+        client_sock.settimeout(None)
         pair.done_event.wait()
     except (ConnectionError, OSError, ProtocolError, RuntimeError) as exc:
         try:
@@ -175,7 +174,7 @@ def handle_connection(client_sock: socket.socket, addr: Tuple[str, int], state: 
     finally:
         if endpoint is not None and not endpoint.paired_event.is_set():
             state.remove_waiting(endpoint)
-        if not relay_thread_started:
+        if pair is None:
             try:
                 client_sock.close()
             except OSError:
