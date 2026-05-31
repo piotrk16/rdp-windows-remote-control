@@ -1,0 +1,25 @@
+# Python cache and virtual environment
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.venv/
+venv/
+
+# Environment and local config
+.env
+.env.*
+*.local
+
+# TLS certs/keys and secrets
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+secrets/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
