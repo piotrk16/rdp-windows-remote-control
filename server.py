@@ -151,9 +151,26 @@ def apply_network_profile(args: argparse.Namespace) -> Dict[str, float | int | b
     return settings
 
 
+def _set_keepalive(sock: socket.socket, idle_sec: int = 30, interval_sec: int = 10, probes: int = 6) -> None:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    try:
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_sec)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval_sec)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, probes)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle_sec * 1000, interval_sec * 1000))
+    except OSError:
+        pass
+
+
 def connect_gateway_host(args: argparse.Namespace) -> socket.socket:
     relay_sock = socket.create_connection((args.gateway_host, args.gateway_port), timeout=15.0)
-    relay_sock.settimeout(120.0)
+    _set_keepalive(relay_sock)
+    relay_sock.settimeout(15.0)
+    print(f"[*] Connecting to gateway {args.gateway_host}:{args.gateway_port} as host")
     send_line_json(
         relay_sock,
         {
@@ -166,9 +183,11 @@ def connect_gateway_host(args: argparse.Namespace) -> socket.socket:
 
     while True:
         reply = recv_line_json(relay_sock)
+        print(f"[*] Gateway reply: {reply}")
         msg_type = str(reply.get("type", ""))
         if msg_type == "wait":
             print("[*] Gateway connected. Waiting for remote client...")
+            relay_sock.settimeout(None)  # wait indefinitely for a client to pair
             continue
         if msg_type == "paired":
             print("[+] Gateway paired with remote client")
@@ -176,7 +195,7 @@ def connect_gateway_host(args: argparse.Namespace) -> socket.socket:
             return relay_sock
         if msg_type == "error":
             raise RuntimeError(str(reply.get("message", "Gateway registration failed")))
-        raise ProtocolError(f"Unexpected gateway reply: {msg_type}")
+        raise ProtocolError(f"Unexpected gateway reply: {reply}")
 
 
 def to_abs_coords(x: int, y: int, monitor: Dict[str, int]) -> tuple[int, int]:
@@ -373,6 +392,9 @@ def client_receiver_loop(
         perform_action(packet, monitor)
 
 
+SESSION_TIMEOUT_SECONDS = 900.0  # 15 minutes
+
+
 def handle_client(
     client_sock: socket.socket,
     addr: tuple[str, int],
@@ -393,6 +415,18 @@ def handle_client(
     print(f"[+] Client connected: {addr[0]}:{addr[1]}")
     stop_event = threading.Event()
     sender_thread: Optional[threading.Thread] = None
+
+    def _session_timeout() -> None:
+        print(f"[!] Session timeout ({SESSION_TIMEOUT_SECONDS:.0f}s) — disconnecting {addr[0]}:{addr[1]}")
+        stop_event.set()
+        try:
+            client_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    timeout_timer = threading.Timer(SESSION_TIMEOUT_SECONDS, _session_timeout)
+    timeout_timer.daemon = True
+    timeout_timer.start()
 
     try:
         hello = recv_packet(client_sock)
@@ -447,6 +481,7 @@ def handle_client(
     except Exception as exc:  # noqa: BLE001
         print(f"[!] Client error ({addr[0]}:{addr[1]}): {exc}")
     finally:
+        timeout_timer.cancel()
         stop_event.set()
         try:
             client_sock.shutdown(socket.SHUT_RDWR)
@@ -494,7 +529,13 @@ def main() -> None:
             raw_client_sock: Optional[socket.socket] = None
             try:
                 raw_client_sock = connect_gateway_host(args)
-                client_sock = tls_context.wrap_socket(raw_client_sock, server_side=True)
+                print("[*] Gateway connection paired, starting TLS handshake")
+                try:
+                    client_sock = tls_context.wrap_socket(raw_client_sock, server_side=True)
+                    print("[+] TLS handshake completed on gateway socket")
+                except ssl.SSLError as exc:
+                    print(f"[!] TLS handshake failed on gateway socket: {exc}")
+                    raise
                 handle_client(
                     client_sock,
                     (f"gateway:{args.gateway_host}", args.gateway_port),

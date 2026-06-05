@@ -20,6 +20,15 @@ venv/
 *.pfx
 secrets/
 
+# Local client connection transfer file
+CLIENT-CONNECT.md
+
+# Temporary AWS diagnostics and helper scripts
+aws/check_gateway_instance.py
+aws/check_gateway_status.py
+aws/inspect_gateway_ec2.py
+aws/open_gateway_ssh.py
+
 # OS/editor files
 .DS_Store
 Thumbs.db

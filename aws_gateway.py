@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_registration(packet: dict) -> tuple[str, SessionKey]:
+def validate_registration(packet: dict) -> Tuple[str, SessionKey]:
     if packet.get("type") != "register":
         raise ProtocolError("Expected register packet")
 
@@ -106,6 +106,8 @@ def pipe(src: socket.socket, dst: socket.socket, stop: threading.Event) -> None:
 
 
 def relay_pair(pair: Pair) -> None:
+    pair.host_sock.settimeout(None)
+    pair.client_sock.settimeout(None)
     stop = threading.Event()
     t = threading.Thread(target=pipe, args=(pair.host_sock, pair.client_sock, stop), daemon=True)
     t.start()
@@ -125,8 +127,12 @@ def relay_pair(pair: Pair) -> None:
 
 
 def wait_for_pair_or_disconnect(endpoint: Endpoint) -> Pair:
-    while not endpoint.paired_event.wait(timeout=1.0):
-        readable, _, exceptional = select.select([endpoint.sock], [], [endpoint.sock], 0)
+    # Use a short select timeout to detect peer disconnect without peeking.
+    # MSG_PEEK races with send_line_json("paired") from the pairing thread.
+    while not endpoint.paired_event.is_set():
+        readable, _, exceptional = select.select([endpoint.sock], [], [endpoint.sock], 0.5)
+        if endpoint.paired_event.is_set():
+            break
         if exceptional:
             raise ConnectionError("Socket error while waiting for pair")
         if readable:
@@ -157,14 +163,16 @@ def handle_connection(client_sock: socket.socket, addr: Tuple[str, int], state: 
             send_line_json(client_sock, {"type": "wait"})
             pair = wait_for_pair_or_disconnect(endpoint)
         else:
-            client_sock.settimeout(None)
             if peer is None:
                 raise RuntimeError("Expected peer endpoint for completed pair")
+            # Clear timeouts on both sockets before any send so relay_pair can
+            # safely call settimeout(None) without racing our sendall calls.
+            peer.sock.settimeout(None)
+            client_sock.settimeout(None)
             send_line_json(peer.sock, {"type": "paired"})
             send_line_json(client_sock, {"type": "paired"})
             threading.Thread(target=relay_pair, args=(pair,), daemon=True).start()
 
-        client_sock.settimeout(None)
         pair.done_event.wait()
     except (ConnectionError, OSError, ProtocolError, RuntimeError) as exc:
         try:
