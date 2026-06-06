@@ -7,7 +7,7 @@ import time
 
 from common import recv_line_json, recv_packet, send_line_json, send_packet
 
-GATEWAY_HOST = "3.250.70.93"
+GATEWAY_HOST = "3.248.230.119"
 GATEWAY_PORT = 59020
 SESSION_ID = "remote-session-8317a7e4"
 GATEWAY_SECRET = "9NkG6JjM6GbI0psKvANy4TmYz8A1l_1e"

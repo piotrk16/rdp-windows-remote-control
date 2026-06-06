@@ -66,8 +66,10 @@ class RemoteDesktopClient(tk.Tk):
         self.frame_queue: Queue[dict[str, Any]] = Queue(maxsize=2)
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.remote_frame: Optional[Image.Image] = None
-        self.server_width = 1
+        self.server_width = 1   # real monitor resolution (from hello_ack, never changes)
         self.server_height = 1
+        self.frame_width = 1    # current scaled frame size (may differ due to scale < 1)
+        self.frame_height = 1
         self.render_w = 1
         self.render_h = 1
         self.render_x = 0
@@ -321,8 +323,8 @@ class RemoteDesktopClient(tk.Tk):
                 if not isinstance(blob, (bytes, bytearray)):
                     continue
 
-                self.server_width = int(packet.get("frame_width", self.server_width))
-                self.server_height = int(packet.get("frame_height", self.server_height))
+                self.frame_width = int(packet.get("frame_width", self.frame_width))
+                self.frame_height = int(packet.get("frame_height", self.frame_height))
 
                 if self.frame_queue.full():
                     try:

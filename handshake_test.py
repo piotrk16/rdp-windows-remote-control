@@ -1,6 +1,6 @@
 ﻿import socket, ssl, hashlib
 from common import recv_line_json, send_line_json
-host = '3.250.70.93'
+host = '3.248.230.119'
 port = 59020
 session = 'remote-session-8317a7e4'
 secret = '9NkG6JjM6GbI0psKvANy4TmYz8A1l_1e'

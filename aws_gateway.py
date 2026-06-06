@@ -34,7 +34,7 @@ class GatewayState:
         self.waiting_hosts: Dict[SessionKey, Endpoint] = {}
         self.waiting_clients: Dict[SessionKey, Endpoint] = {}
 
-    def register(self, endpoint: Endpoint) -> tuple[Optional[Pair], Optional[Endpoint]]:
+    def register(self, endpoint: Endpoint) -> Tuple[Optional[Pair], Optional[Endpoint]]:
         with self.lock:
             if endpoint.role == "host":
                 peer = self.waiting_clients.pop(endpoint.key, None)
