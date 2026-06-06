@@ -387,9 +387,32 @@ def client_receiver_loop(
     stop_event: threading.Event,
     monitor: Dict[str, int],
 ) -> None:
+    pending_move: Optional[Dict[str, object]] = None
     while not stop_event.is_set():
         packet = recv_packet(client_sock)
-        perform_action(packet, monitor)
+        if packet.get("type") == "mouse_move":
+            pending_move = packet
+            # Drain any immediately buffered moves, keeping only the latest.
+            client_sock.settimeout(0)
+            try:
+                while True:
+                    next_packet = recv_packet(client_sock)
+                    if next_packet.get("type") == "mouse_move":
+                        pending_move = next_packet
+                    else:
+                        perform_action(pending_move, monitor)
+                        pending_move = None
+                        perform_action(next_packet, monitor)
+                        break
+            except (BlockingIOError, ssl.SSLWantReadError):
+                pass
+            finally:
+                client_sock.settimeout(None)
+            if pending_move is not None:
+                perform_action(pending_move, monitor)
+                pending_move = None
+        else:
+            perform_action(packet, monitor)
 
 
 SESSION_TIMEOUT_SECONDS = 900.0  # 15 minutes
