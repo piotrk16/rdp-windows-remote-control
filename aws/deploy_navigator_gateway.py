@@ -5,9 +5,9 @@ import boto3
 from botocore.exceptions import ClientError
 
 ROOT = os.path.dirname(__file__)
-AWS_CREDS_PATH = os.path.join(ROOT, '.awscreds')
+AWS_CREDS_PATH = os.path.join(ROOT, '.allcreds')
 if not os.path.exists(AWS_CREDS_PATH):
-    root_creds = os.path.join(os.path.dirname(ROOT), '.awscreds')
+    root_creds = os.path.join(os.path.dirname(ROOT), '.allcreds')
     if os.path.exists(root_creds):
         AWS_CREDS_PATH = root_creds
 
