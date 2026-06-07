@@ -386,10 +386,13 @@ def client_receiver_loop(
     client_sock: socket.socket,
     stop_event: threading.Event,
     monitor: Dict[str, int],
+    on_activity: Optional[threading.Timer] = None,
 ) -> None:
     pending_move: Optional[Dict[str, object]] = None
     while not stop_event.is_set():
         packet = recv_packet(client_sock)
+        if on_activity is not None:
+            on_activity()
         if packet.get("type") == "mouse_move":
             pending_move = packet
             # Drain any immediately buffered moves, keeping only the latest.
@@ -415,7 +418,7 @@ def client_receiver_loop(
             perform_action(packet, monitor)
 
 
-SESSION_TIMEOUT_SECONDS = 900.0  # 15 minutes
+IDLE_TIMEOUT_SECONDS = 900.0  # 15 minutes of inactivity
 
 
 def handle_client(
@@ -439,17 +442,27 @@ def handle_client(
     stop_event = threading.Event()
     sender_thread: Optional[threading.Thread] = None
 
-    def _session_timeout() -> None:
-        print(f"[!] Session timeout ({SESSION_TIMEOUT_SECONDS:.0f}s) — disconnecting {addr[0]}:{addr[1]}")
+    _idle_timer_lock = threading.Lock()
+    _idle_timer: list[Optional[threading.Timer]] = [None]
+
+    def _session_idle_timeout() -> None:
+        print(f"[!] Idle timeout ({IDLE_TIMEOUT_SECONDS:.0f}s) — disconnecting {addr[0]}:{addr[1]}")
         stop_event.set()
         try:
             client_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
-    timeout_timer = threading.Timer(SESSION_TIMEOUT_SECONDS, _session_timeout)
-    timeout_timer.daemon = True
-    timeout_timer.start()
+    def _reset_idle_timer() -> None:
+        with _idle_timer_lock:
+            if _idle_timer[0] is not None:
+                _idle_timer[0].cancel()
+            t = threading.Timer(IDLE_TIMEOUT_SECONDS, _session_idle_timeout)
+            t.daemon = True
+            t.start()
+            _idle_timer[0] = t
+
+    _reset_idle_timer()
 
     try:
         hello = recv_packet(client_sock)
@@ -498,13 +511,15 @@ def handle_client(
         )
         sender_thread.start()
 
-        client_receiver_loop(client_sock, stop_event, monitor)
+        client_receiver_loop(client_sock, stop_event, monitor, on_activity=_reset_idle_timer)
     except (ConnectionError, OSError, ProtocolError) as exc:
         print(f"[!] Client disconnected ({addr[0]}:{addr[1]}): {exc}")
     except Exception as exc:  # noqa: BLE001
         print(f"[!] Client error ({addr[0]}:{addr[1]}): {exc}")
     finally:
-        timeout_timer.cancel()
+        with _idle_timer_lock:
+            if _idle_timer[0] is not None:
+                _idle_timer[0].cancel()
         stop_event.set()
         try:
             client_sock.shutdown(socket.SHUT_RDWR)

@@ -2,6 +2,7 @@ import hashlib
 import io
 import socket
 import ssl
+import sys
 import threading
 import time
 import tkinter as tk
@@ -75,6 +76,12 @@ class RemoteDesktopClient(tk.Tk):
         self.render_x = 0
         self.render_y = 0
         self.last_move_sent = 0.0
+        self.immersive = False
+        self._exit_overlay: Optional[tk.Toplevel] = None
+        self._kb_hook_handle: list = [None]
+        self._kb_hook_proc: Any = None
+        self._kb_hook_thread: Optional[threading.Thread] = None
+        self._kb_thread_id: Optional[int] = None
         self.stats_lock = threading.Lock()
         self._reset_stats()
 
@@ -112,10 +119,13 @@ class RemoteDesktopClient(tk.Tk):
         }
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self, padding=8)
+        self._toolbar = ttk.Frame(self)
+        self._toolbar.pack(fill=tk.X)
+
+        top = ttk.Frame(self._toolbar, padding=8)
         top.pack(fill=tk.X)
 
-        top2 = ttk.Frame(self, padding=(8, 0, 8, 8))
+        top2 = ttk.Frame(self._toolbar, padding=(8, 0, 8, 8))
         top2.pack(fill=tk.X)
 
         ttk.Label(top, text="Host:").pack(side=tk.LEFT)
@@ -152,6 +162,9 @@ class RemoteDesktopClient(tk.Tk):
         self.connect_btn = ttk.Button(top, text="Connect", command=self._toggle_connection)
         self.connect_btn.pack(side=tk.LEFT)
 
+        self.fullscreen_btn = ttk.Button(top, text="⛶ Fullscreen", command=self._enter_immersive)
+        self.fullscreen_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         self.status_var = tk.StringVar(value="Disconnected")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
 
@@ -170,12 +183,14 @@ class RemoteDesktopClient(tk.Tk):
 
         self.bind("<KeyPress>", self._on_key_press)
         self.bind("<KeyRelease>", self._on_key_release)
+        self.bind("<F11>", lambda _e: self._toggle_immersive() or "break")
 
         info = (
             "Use left/middle/right mouse buttons and wheel directly on the preview. "
-            "Click inside the preview before typing keys."
+            "Click inside the preview before typing keys. Press F11 for fullscreen."
         )
-        ttk.Label(self, text=info, padding=6).pack(fill=tk.X)
+        self._hint_label = ttk.Label(self, text=info, padding=6)
+        self._hint_label.pack(fill=tk.X)
 
     def _toggle_connection(self) -> None:
         if self.connected:
@@ -426,6 +441,8 @@ class RemoteDesktopClient(tk.Tk):
             self.stats_last_rendered = self.stats_tot_rendered
 
     def _draw_stats_overlay(self) -> None:
+        if self.immersive:
+            return
         with self.stats_lock:
             stats = dict(self.stats_view)
 
@@ -546,6 +563,8 @@ class RemoteDesktopClient(tk.Tk):
     def _on_key_press(self, event: tk.Event) -> None:
         if not self.connected:
             return
+        if event.keysym == "F11":
+            return
         key = self._map_tk_key(event)
         if key:
             self._send({"type": "key_event", "event": "down", "key": key})
@@ -553,11 +572,159 @@ class RemoteDesktopClient(tk.Tk):
     def _on_key_release(self, event: tk.Event) -> None:
         if not self.connected:
             return
+        if event.keysym == "F11":
+            return
         key = self._map_tk_key(event)
         if key:
             self._send({"type": "key_event", "event": "up", "key": key})
 
+    def _toggle_immersive(self) -> None:
+        if self.immersive:
+            self._exit_immersive()
+        else:
+            self._enter_immersive()
+
+    def _enter_immersive(self) -> None:
+        if self.immersive:
+            return
+        self.immersive = True
+        self.attributes("-fullscreen", True)
+        self._toolbar.pack_forget()
+        self._hint_label.pack_forget()
+        self._create_exit_overlay()
+        self._install_kb_hook()
+
+    def _exit_immersive(self) -> None:
+        if not self.immersive:
+            return
+        self.immersive = False
+        self.attributes("-fullscreen", False)
+        self._toolbar.pack(fill=tk.X, before=self.canvas)
+        self._hint_label.pack(fill=tk.X)
+        if self._exit_overlay is not None:
+            try:
+                self._exit_overlay.destroy()
+            except tk.TclError:
+                pass
+            self._exit_overlay = None
+        self._uninstall_kb_hook()
+
+    def _create_exit_overlay(self) -> None:
+        overlay = tk.Toplevel(self)
+        overlay.overrideredirect(True)
+        overlay.attributes("-alpha", 0.65)
+        overlay.attributes("-topmost", True)
+        overlay.configure(bg="#1a1a1a")
+        lbl = tk.Label(
+            overlay,
+            text="✕  Exit Fullscreen",
+            bg="#1a1a1a",
+            fg="#ffffff",
+            font=("Segoe UI", 11),
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        )
+        lbl.pack()
+        for widget in (overlay, lbl):
+            widget.bind("<Button-1>", lambda _e: self.after(0, self._exit_immersive))
+        self.update_idletasks()
+        overlay.update_idletasks()
+        sw = self.winfo_screenwidth()
+        ow = overlay.winfo_reqwidth()
+        overlay.geometry(f"+{sw - ow - 20}+20")
+        self._exit_overlay = overlay
+
+    def _install_kb_hook(self) -> None:
+        """Low-level Windows keyboard hook: intercepts Win key and Alt+Tab in immersive mode."""
+        if not sys.platform.startswith("win"):
+            return
+        import ctypes
+        import ctypes.wintypes
+
+        _WH_KEYBOARD_LL = 13
+        _WM_KEYDOWN = 0x0100
+        _WM_SYSKEYDOWN = 0x0104
+        _WM_KEYUP = 0x0101
+        _WM_SYSKEYUP = 0x0105
+        _VK_LWIN = 0x5B
+        _VK_RWIN = 0x5C
+        _VK_TAB = 0x09
+        _LLKHF_ALTDOWN = 0x20
+
+        class _KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("vkCode", ctypes.wintypes.DWORD),
+                ("scanCode", ctypes.wintypes.DWORD),
+                ("flags", ctypes.wintypes.DWORD),
+                ("time", ctypes.wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_ulong),
+            ]
+
+        _HOOKPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM
+        )
+        handle_ref = self._kb_hook_handle
+
+        def _low_level_handler(nCode: int, wParam: int, lParam: int) -> int:
+            if nCode >= 0:
+                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                vk = kb.vkCode
+                alt_down = bool(kb.flags & _LLKHF_ALTDOWN)
+                if wParam in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
+                    event = "down"
+                elif wParam in (_WM_KEYUP, _WM_SYSKEYUP):
+                    event = "up"
+                else:
+                    event = None
+                if event is not None:
+                    key: Optional[str] = None
+                    if vk == _VK_LWIN:
+                        key = "winleft"
+                    elif vk == _VK_RWIN:
+                        key = "winright"
+                    elif vk == _VK_TAB and alt_down:
+                        key = "tab"
+                    if key:
+                        if self.connected:
+                            self._send({"type": "key_event", "event": event, "key": key})
+                        return 1  # suppress local action
+            return ctypes.windll.user32.CallNextHookEx(handle_ref[0], nCode, wParam, lParam)
+
+        hook_proc = _HOOKPROC(_low_level_handler)
+        self._kb_hook_proc = hook_proc  # keep reference alive for the duration of the hook
+
+        def _hook_thread() -> None:
+            handle_ref[0] = ctypes.windll.user32.SetWindowsHookExW(
+                _WH_KEYBOARD_LL, hook_proc, None, 0
+            )
+            self._kb_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+            msg = ctypes.wintypes.MSG()
+            while True:
+                ret = ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret == 0 or ret == -1:
+                    break
+                ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+                ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+            if handle_ref[0]:
+                ctypes.windll.user32.UnhookWindowsHookEx(handle_ref[0])
+                handle_ref[0] = None
+
+        t = threading.Thread(target=_hook_thread, daemon=True)
+        t.start()
+        self._kb_hook_thread = t
+
+    def _uninstall_kb_hook(self) -> None:
+        if not sys.platform.startswith("win"):
+            return
+        thread_id = self._kb_thread_id
+        if thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
+            self._kb_thread_id = None
+
     def _on_close(self) -> None:
+        self._exit_immersive()
         self._disconnect("Disconnected")
         self.destroy()
 
